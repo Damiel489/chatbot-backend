@@ -1,170 +1,145 @@
-require('dotenv').config();
 const express = require('express');
-const dialogflow = require('@google-cloud/dialogflow');
-const uuid = require('uuid');
+const fetch = require('node-fetch');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// ============================
-// Dialogflow Config
-// ============================
-const projectId = process.env.PROJECT_ID;
+// ===== CONFIG =====
+const PORT = process.env.PORT || 3000;
 
-const sessionClient = new dialogflow.SessionsClient({
-  credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS)
-});
-
-// ============================
-// Supabase Config
-// ============================
 const supabase = createClient(
-  process.env.https://rlnyofcslojmnfzlswhz.supabase.co,
-  process.env.sb_publishable_gKVzzTO5sfloRoMYxVoZzw_6A7qxk8W
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
 );
 
-// ============================
-// Detect Intent Function
-// ============================
-async function detectIntent(text, sessionId) {
-  const sessionPath = sessionClient.projectAgentSessionPath(
-    projectId,
-    sessionId
-  );
+const FONNTE_TOKEN = process.env.FONNTE_TOKEN;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-  const request = {
-    session: sessionPath,
-    queryInput: {
-      text: {
-        text: text,
-        languageCode: 'id'
-      }
-    }
-  };
-
-  const responses = await sessionClient.detectIntent(request);
-  const result = responses[0].queryResult;
-
-  return {
-    reply: result.fulfillmentText,
-    intent: result.intent.displayName,
-    confidence: result.intentDetectionConfidence,
-    parameters: result.parameters
-  };
-}
-
-// ============================
-// Test Route
-// ============================
+// ===== ROOT =====
 app.get('/', (req, res) => {
-  res.send('Backend Chatbot PPDB Aktif');
+  res.send('Chatbot backend aktif');
 });
 
-// ============================
-// Webhook Utama
-// ============================
+// ===== WEBHOOK =====
 app.post('/webhook', async (req, res) => {
   try {
+    console.log('Incoming:', req.body);
 
-    // ======================
-    // Ambil pesan user
-    // ======================
-    const userMessage = req.body.message;
-    const sender = req.body.sender || uuid.v4();
+    const raw = (req.body.message || req.body.text || '').toString();
+    const message = raw.toLowerCase().trim();
+    const sender = req.body.sender;
 
-    if (!userMessage) {
-      return res.json({ reply: "Pesan kosong." });
+    if (!message || !sender) {
+      return res.sendStatus(200);
     }
 
-    // ======================
-    // Kirim ke Dialogflow
-    // ======================
-    const df = await detectIntent(userMessage, sender);
+    let response = '';
+    let source = '';
 
-    console.log({
-      user: sender,
-      message: userMessage,
-      intent: df.intent,
-      confidence: df.confidence,
-      parameters: df.parameters
-    });
+    // ===== RULE CHECK =====
+    const { data: triggers, error: errTrig } = await supabase
+      .from('trigger')
+      .select('*');
 
-    // ======================
-    // 1. Simpan Log Chat
-    // ======================
+    if (errTrig) console.error('Trigger error:', errTrig);
+
+    const found = triggers?.find(t =>
+      message.includes((t.keyword || '').toLowerCase())
+    );
+
+    if (found) {
+      const { data: responses, error: errResp } = await supabase
+        .from('response')
+        .select('*')
+        .eq('intent_id', found.intent_id);
+
+      if (errResp) console.error('Response error:', errResp);
+
+      if (responses && responses.length > 0) {
+        const i = Math.floor(Math.random() * responses.length);
+        response = responses[i].text;
+        source = 'rule';
+      }
+    }
+
+    // ===== AI FALLBACK =====
+    if (!response) {
+      response = await getGeminiResponse(message);
+      source = 'ai';
+    }
+
+    // ===== LOG =====
     await supabase.from('log_chat').insert([
       {
-        nomor_wa: sender,
-        pesan: userMessage,
-        intent: df.intent,
-        confidence: df.confidence
+        user_message: message,
+        bot_response: response,
+        source
       }
     ]);
 
-    // ======================
-    // 2. Simpan Calon Siswa Berdasarkan Intent
-    // ======================
+    // ===== SEND WA =====
+    await sendFonnte(sender, response);
 
-    // Saat user menyatakan minat daftar
-    if (df.intent === "daftar_minat") {
-      await supabase.from('calon_siswa').upsert([
-        {
-          nomor_wa: sender,
-          status: 'minat'
-        }
-      ], { onConflict: 'nomor_wa' });
-    }
+    return res.sendStatus(200);
 
-    // Saat user mengisi nama orang tua
-    if (df.intent === "isi_nama_orang_tua") {
-      await supabase.from('calon_siswa').upsert([
-        {
-          nomor_wa: sender,
-          nama_orang_tua: df.parameters.nama,
-          status: 'isi_data'
-        }
-      ], { onConflict: 'nomor_wa' });
-    }
-
-    // Saat user mengisi nama siswa
-    if (df.intent === "isi_nama_siswa") {
-      await supabase.from('calon_siswa').upsert([
-        {
-          nomor_wa: sender,
-          nama_siswa: df.parameters.nama_siswa,
-          status: 'isi_data'
-        }
-      ], { onConflict: 'nomor_wa' });
-    }
-
-    // Saat user memilih jenjang
-    if (df.intent === "pilih_jenjang") {
-      await supabase.from('calon_siswa').upsert([
-        {
-          nomor_wa: sender,
-          jenjang: df.parameters.jenjang,
-          status: 'isi_data'
-        }
-      ], { onConflict: 'nomor_wa' });
-    }
-
-    // ======================
-    // 3. Kirim Balasan ke User
-    // ======================
-    res.json({
-      reply: df.reply
-    });
-
-  } catch (error) {
-    console.error(error);
-    res.status(500).send("Terjadi kesalahan di server");
+  } catch (err) {
+    console.error('Webhook error:', err);
+    return res.sendStatus(500);
   }
 });
 
-// ============================
-// Jalankan Server
-// ============================
-app.listen(process.env.PORT || 3000, () => {
-  console.log('Server berjalan');
+// ===== SEND FONNTE =====
+async function sendFonnte(target, message) {
+  try {
+    await fetch('https://api.fonnte.com/send', {
+      method: 'POST',
+      headers: {
+        'Authorization': FONNTE_TOKEN
+      },
+      body: new URLSearchParams({
+        target,
+        message
+      })
+    });
+  } catch (err) {
+    console.error('Fonnte error:', err);
+  }
+}
+
+// ===== GEMINI =====
+async function getGeminiResponse(userMessage) {
+  try {
+    const prompt = `
+Kamu adalah chatbot PPDB sekolah.
+Jawab singkat, jelas, dan relevan:
+"${userMessage}"
+`;
+
+    const result = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }]
+        })
+      }
+    );
+
+    const data = await result.json();
+
+    return data?.candidates?.[0]?.content?.parts?.[0]?.text
+      || 'Maaf, saya belum bisa menjawab itu.';
+
+  } catch (err) {
+    console.error('Gemini error:', err);
+    return 'Terjadi kesalahan pada sistem.';
+  }
+}
+
+// ===== START =====
+app.listen(PORT, () => {
+  console.log('Server running on port ' + PORT);
 });
